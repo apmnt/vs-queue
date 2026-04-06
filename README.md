@@ -36,6 +36,12 @@ Watch an existing log file without launching anything:
 ./target/release/vs-queue --watch ./queue.log
 ```
 
+Watch Vintage Story queue on normal Linux installation
+
+```bash
+./target/release/vs-queue --watch ~/.config/VintagestoryData/Logs/client-main.log
+```
+
 Notes:
 
 - The child process path can be absolute, relative, or a command name on `PATH`.
