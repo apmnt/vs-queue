@@ -70,8 +70,8 @@ struct Cli {
     log_file: Option<PathBuf>,
     #[arg(
         long,
-        default_value_t = 20,
-        help = "How many queue samples to use in the rolling regression."
+        default_value_t = 0,
+        help = "How many queue changes to use in the weighted regression. Use 0 for all changes."
     )]
     regression_samples: usize,
     #[arg(
@@ -100,6 +100,7 @@ struct Estimate {
     remaining: Duration,
     positions_per_minute: f64,
     finish_elapsed_seconds: f64,
+    slope: f64,
 }
 
 struct ChartData {
@@ -146,6 +147,7 @@ struct AppState {
     recent_logs: VecDeque<String>,
     samples: Vec<QueueSample>,
     max_seen_position: f64,
+    display_slope: Option<f64>,
     projected_curve: Vec<(f64, f64)>,
 }
 
@@ -159,6 +161,7 @@ impl AppState {
             recent_logs: VecDeque::with_capacity(cli.recent_logs),
             samples: Vec::new(),
             max_seen_position: 0.0,
+            display_slope: None,
             projected_curve: Vec::new(),
         }
     }
@@ -169,6 +172,9 @@ impl AppState {
         let mut parsed = parse_queue_sample(line)?;
         let received_at = Local::now().naive_local();
         if let Some(previous) = self.samples.last() {
+            if (parsed.position - previous.position).abs() <= f64::EPSILON {
+                return None;
+            }
             let is_liveish = (received_at - parsed.timestamp)
                 .num_seconds()
                 .unsigned_abs()
@@ -200,26 +206,67 @@ impl AppState {
     }
 
     fn refresh_projection(&mut self, estimate: Option<&Estimate>) {
-        let Some(first) = self.samples.first() else {
-            return;
-        };
-
         if let Some(estimate) = estimate {
-            let observed: Vec<(f64, f64)> = self
-                .samples
-                .iter()
-                .map(|sample| {
-                    (
-                        elapsed_seconds(first.timestamp, sample.timestamp),
-                        sample.position,
-                    )
-                })
-                .collect();
-            if let Some(curve) = build_projection_curve(&observed, estimate.finish_elapsed_seconds)
-            {
-                self.projected_curve = curve;
+            self.update_display_fit(estimate);
+        }
+
+        if self.displayed_estimate().is_none() {
+            if let Some(estimate) = estimate {
+                self.display_slope = Some(estimate.slope);
             }
         }
+
+        if let (Some(display_estimate), Some(first), Some(current)) = (
+            self.displayed_estimate(),
+            self.samples.first(),
+            self.samples.last(),
+        ) {
+            let current_elapsed_seconds = elapsed_seconds(first.timestamp, current.timestamp);
+            self.projected_curve = build_projection_line(
+                current_elapsed_seconds,
+                current.position,
+                display_estimate.finish_elapsed_seconds,
+            );
+        }
+    }
+
+    fn update_display_fit(&mut self, estimate: &Estimate) {
+        const ALPHA: f64 = 0.15;
+
+        self.display_slope = Some(match self.display_slope {
+            Some(previous) => previous + ((estimate.slope - previous) * ALPHA),
+            None => estimate.slope,
+        });
+    }
+
+    fn displayed_estimate(&self) -> Option<Estimate> {
+        let first = self.samples.first()?;
+        let current = self.samples.last()?;
+        if current.position <= 0.0 {
+            return None;
+        }
+
+        let slope = self.display_slope?;
+        if slope >= -f64::EPSILON {
+            return None;
+        }
+
+        let current_elapsed_seconds = elapsed_seconds(first.timestamp, current.timestamp);
+        let remaining_seconds = current.position / -slope;
+        if !remaining_seconds.is_finite() || remaining_seconds <= 0.0 {
+            return None;
+        }
+
+        let finish_elapsed_seconds = current_elapsed_seconds + remaining_seconds;
+        let remaining = Duration::milliseconds((remaining_seconds * 1000.0).round() as i64);
+        let eta = current.timestamp + remaining;
+        Some(Estimate {
+            eta,
+            remaining,
+            positions_per_minute: -slope * 60.0,
+            finish_elapsed_seconds,
+            slope,
+        })
     }
 }
 
@@ -355,14 +402,18 @@ fn track_loop(
         None
     };
 
+    let mut saw_new_lines = false;
+    drain_new_lines(&mut follower, &mut state, cli, &mut saw_new_lines)?;
+
     let mut estimate = compute_estimate(&state.samples, cli.regression_samples);
     state.refresh_projection(estimate.as_ref());
+    let mut display_estimate = state.displayed_estimate();
     if let Some(tui) = tui.as_mut() {
-        tui.draw(&state, estimate.as_ref(), exit_status)?;
+        tui.draw(&state, display_estimate.as_ref(), exit_status)?;
     }
 
     loop {
-        let mut saw_new_lines = false;
+        saw_new_lines = false;
         drain_new_lines(&mut follower, &mut state, cli, &mut saw_new_lines)?;
 
         if let Some(child) = child.as_mut() {
@@ -379,9 +430,10 @@ fn track_loop(
 
         estimate = compute_estimate(&state.samples, cli.regression_samples);
         state.refresh_projection(estimate.as_ref());
+        display_estimate = state.displayed_estimate();
 
         if let Some(tui) = tui.as_mut() {
-            tui.draw(&state, estimate.as_ref(), exit_status)?;
+            tui.draw(&state, display_estimate.as_ref(), exit_status)?;
         }
 
         if state.output_is_tty {
@@ -399,8 +451,9 @@ fn track_loop(
                     );
                     estimate = compute_estimate(&state.samples, cli.regression_samples);
                     state.refresh_projection(estimate.as_ref());
+                    display_estimate = state.displayed_estimate();
                     if let Some(tui) = tui.as_mut() {
-                        tui.draw(&state, estimate.as_ref(), exit_status)?;
+                        tui.draw(&state, display_estimate.as_ref(), exit_status)?;
                     }
                 }
                 break;
@@ -577,7 +630,7 @@ fn render_tui(
     let chart_inner = chart_block.inner(chunks[1]);
     frame.render_widget(chart_block, chunks[1]);
 
-    if let Some(chart_data) = build_chart_data(state, estimate) {
+    if let Some(chart_data) = build_chart_data(state) {
         render_braille_chart(frame, chart_inner, &chart_data);
     } else {
         let placeholder = Paragraph::new("Waiting for a log line matching `... position: <n>`")
@@ -804,7 +857,7 @@ fn y_tick_row(tick: f64, y_bounds: [f64; 2], height: usize) -> usize {
     (normalized * (height.saturating_sub(1) as f64)).round() as usize
 }
 
-fn build_chart_data(state: &AppState, _estimate: Option<&Estimate>) -> Option<ChartData> {
+fn build_chart_data(state: &AppState) -> Option<ChartData> {
     let first = state.samples.first()?;
     let last = state.samples.last()?;
     let current_elapsed_seconds = elapsed_seconds(first.timestamp, last.timestamp);
@@ -846,100 +899,30 @@ fn build_chart_data(state: &AppState, _estimate: Option<&Estimate>) -> Option<Ch
     })
 }
 
-fn build_projection_curve(
-    observed: &[(f64, f64)],
+fn build_projection_line(
+    current_elapsed_seconds: f64,
+    current_position: f64,
     finish_elapsed_seconds: f64,
-) -> Option<Vec<(f64, f64)>> {
-    let &(current_elapsed_seconds, _) = observed.last()?;
-    let &(start_elapsed_seconds, start_position) = observed.first()?;
+) -> Vec<(f64, f64)> {
     if !finish_elapsed_seconds.is_finite()
-        || finish_elapsed_seconds <= start_elapsed_seconds
-        || current_elapsed_seconds < start_elapsed_seconds
+        || finish_elapsed_seconds <= current_elapsed_seconds
+        || current_position <= 0.0
     {
-        return Some(observed.to_vec());
+        return Vec::new();
     }
 
-    let (control_one, control_two) =
-        fit_projection_controls(observed, start_position, finish_elapsed_seconds);
-    let samples = 96_usize;
+    let segment_seconds = finish_elapsed_seconds - current_elapsed_seconds;
+    let samples = 64_usize;
     let mut points = Vec::with_capacity(samples + 1);
 
     for index in 0..=samples {
         let progress = index as f64 / samples as f64;
-        let x = finish_elapsed_seconds * progress;
-        let y = cubic_bezier_value(progress, start_position, control_one, control_two, 0.0)
-            .clamp(0.0, start_position.max(0.0));
+        let x = current_elapsed_seconds + (segment_seconds * progress);
+        let y = (current_position * (1.0 - progress)).max(0.0);
         points.push((x, y));
     }
 
-    Some(points)
-}
-
-fn fit_projection_controls(
-    observed: &[(f64, f64)],
-    start_position: f64,
-    finish_elapsed_seconds: f64,
-) -> (f64, f64) {
-    let linear_control_one = start_position * (2.0 / 3.0);
-    let linear_control_two = start_position * (1.0 / 3.0);
-    if observed.len() < 4 || finish_elapsed_seconds <= f64::EPSILON {
-        return (linear_control_one, linear_control_two);
-    }
-
-    let mut s11 = 0.0;
-    let mut s12 = 0.0;
-    let mut s22 = 0.0;
-    let mut t1 = 0.0;
-    let mut t2 = 0.0;
-    let count = observed.len().saturating_sub(1).max(1) as f64;
-
-    for (index, (elapsed_seconds, position)) in observed.iter().enumerate() {
-        let u = (*elapsed_seconds / finish_elapsed_seconds).clamp(0.0, 1.0);
-        let one_minus = 1.0 - u;
-        let b0 = one_minus.powi(3);
-        let b1 = 3.0 * one_minus.powi(2) * u;
-        let b2 = 3.0 * one_minus * u.powi(2);
-        let target = *position - (b0 * start_position);
-        let weight = 1.0 + 3.0 * ((index as f64) / count).powi(2);
-
-        s11 += weight * b1 * b1;
-        s12 += weight * b1 * b2;
-        s22 += weight * b2 * b2;
-        t1 += weight * b1 * target;
-        t2 += weight * b2 * target;
-    }
-
-    let determinant = (s11 * s22) - (s12 * s12);
-    if determinant.abs() <= f64::EPSILON {
-        return (linear_control_one, linear_control_two);
-    }
-
-    let mut control_one = ((t1 * s22) - (t2 * s12)) / determinant;
-    let mut control_two = ((s11 * t2) - (s12 * t1)) / determinant;
-    control_one = control_one.clamp(0.0, start_position.max(0.0));
-    control_two = control_two.clamp(0.0, start_position.max(0.0));
-    if control_one < control_two {
-        std::mem::swap(&mut control_one, &mut control_two);
-    }
-    control_two = control_two.clamp(0.0, control_one);
-
-    let blend = ((observed.len().saturating_sub(2) as f64) / 6.0).clamp(0.0, 1.0);
-    (
-        lerp(linear_control_one, control_one, blend),
-        lerp(linear_control_two, control_two, blend),
-    )
-}
-
-fn cubic_bezier_value(t: f64, p0: f64, p1: f64, p2: f64, p3: f64) -> f64 {
-    let one_minus = 1.0 - t;
-    (one_minus.powi(3) * p0)
-        + (3.0 * one_minus.powi(2) * t * p1)
-        + (3.0 * one_minus * t.powi(2) * p2)
-        + (t.powi(3) * p3)
-}
-
-fn lerp(start: f64, end: f64, t: f64) -> f64 {
-    start + ((end - start) * t)
+    points
 }
 
 fn queue_axis_ticks(y_max: f64) -> [f64; 3] {
@@ -966,8 +949,16 @@ fn compute_estimate(samples: &[QueueSample], regression_samples: usize) -> Optio
 
     let first = samples.first()?;
     let current = samples.last()?;
-    let window_len = regression_samples.max(2).min(samples.len());
-    let window = &samples[samples.len() - window_len..];
+    if current.position <= 0.0 {
+        return None;
+    }
+
+    let window = if regression_samples == 0 {
+        samples
+    } else {
+        let window_len = regression_samples.max(2).min(samples.len());
+        &samples[samples.len() - window_len..]
+    };
 
     let points: Vec<(f64, f64)> = window
         .iter()
@@ -979,7 +970,7 @@ fn compute_estimate(samples: &[QueueSample], regression_samples: usize) -> Optio
         })
         .collect();
 
-    let slope = regression_slope(&points)?;
+    let slope = weighted_regression_slope(&points)?;
     if slope >= -f64::EPSILON {
         return None;
     }
@@ -990,35 +981,46 @@ fn compute_estimate(samples: &[QueueSample], regression_samples: usize) -> Optio
         return None;
     }
 
+    let finish_elapsed_seconds = current_elapsed_seconds + remaining_seconds;
     let remaining = Duration::milliseconds((remaining_seconds * 1000.0).round() as i64);
     let eta = current.timestamp + remaining;
     Some(Estimate {
         eta,
         remaining,
         positions_per_minute: -slope * 60.0,
-        finish_elapsed_seconds: current_elapsed_seconds + remaining_seconds,
+        finish_elapsed_seconds,
+        slope,
     })
 }
 
-fn regression_slope(points: &[(f64, f64)]) -> Option<f64> {
-    let n = points.len() as f64;
-    if n < 2.0 {
+fn weighted_regression_slope(points: &[(f64, f64)]) -> Option<f64> {
+    if points.len() < 2 {
         return None;
     }
 
-    let (sum_x, sum_y, sum_xx, sum_xy) = points.iter().fold(
-        (0.0, 0.0, 0.0, 0.0),
-        |(sum_x, sum_y, sum_xx, sum_xy), (x, y)| {
-            (sum_x + x, sum_y + y, sum_xx + x * x, sum_xy + x * y)
-        },
-    );
+    let count = points.len().saturating_sub(1).max(1) as f64;
+    let mut sum_w = 0.0;
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut sum_xx = 0.0;
+    let mut sum_xy = 0.0;
 
-    let denominator = (n * sum_xx) - (sum_x * sum_x);
+    for (index, (x, y)) in points.iter().enumerate() {
+        let progress = (index as f64) / count;
+        let weight = 1.0 + (progress * 2.0);
+        sum_w += weight;
+        sum_x += weight * x;
+        sum_y += weight * y;
+        sum_xx += weight * x * x;
+        sum_xy += weight * x * y;
+    }
+
+    let denominator = (sum_w * sum_xx) - (sum_x * sum_x);
     if denominator.abs() <= f64::EPSILON {
         return None;
     }
 
-    Some(((n * sum_xy) - (sum_x * sum_y)) / denominator)
+    Some(((sum_w * sum_xy) - (sum_x * sum_y)) / denominator)
 }
 
 fn parse_queue_sample(line: &str) -> Option<QueueSample> {
@@ -1226,17 +1228,45 @@ mod tests {
         assert_eq!(estimate.positions_per_minute.round(), 10.0);
         assert_eq!(estimate.remaining, Duration::minutes(8));
         assert_eq!(estimate.eta, start + Duration::minutes(10));
+        assert!((estimate.slope + (1.0 / 6.0)).abs() < 0.000_001);
     }
 
     #[test]
-    fn projection_curve_spans_from_start_to_finish() {
-        let curve = build_projection_curve(&[(0.0, 100.0), (60.0, 90.0)], 600.0)
-            .expect("curve should exist");
+    fn projection_line_only_covers_future_progress() {
+        let curve = build_projection_line(120.0, 80.0, 600.0);
 
         let first = curve.first().expect("curve has start");
         let last = curve.last().expect("curve has end");
-        assert_eq!(*first, (0.0, 100.0));
+        assert_eq!(*first, (120.0, 80.0));
         assert_eq!(last.0, 600.0);
         assert_eq!(last.1, 0.0);
+    }
+
+    #[test]
+    fn record_line_ignores_repeated_queue_positions() {
+        let cli = Cli {
+            watch: Some(PathBuf::from("example.log")),
+            executable: None,
+            args: Vec::new(),
+            log_file: None,
+            regression_samples: 0,
+            recent_logs: 8,
+            refresh_ms: 250,
+        };
+        let mut state = AppState::new(
+            SessionKind::Watch,
+            PathBuf::from("example.log"),
+            &cli,
+            false,
+        );
+
+        let first =
+            "6.4.2026 17:07:03 [Client Notification] Client is in connect queue at position: 90";
+        let repeated =
+            "6.4.2026 17:07:05 [Client Notification] Client is in connect queue at position: 90";
+
+        assert!(state.record_line(first).is_some());
+        assert!(state.record_line(repeated).is_none());
+        assert_eq!(state.samples.len(), 1);
     }
 }
