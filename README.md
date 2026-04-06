@@ -10,6 +10,7 @@ It keeps a rolling estimate of when the queue will reach zero and draws the obse
 
 When you launch a process through `vs-queue`, the child is detached from the tracker on Unix and writes its output to a real log file. In the TUI, `q`, `Esc`, or `Ctrl-C` stop only `vs-queue`; the launched process keeps running. When the child reaches queue position `0` and exits, the TUI stays open on the final chart until you quit it manually.
 
+To use this tool you need to install rust: https://rust-lang.org/tools/install/
 ## Build
 
 ```bash
