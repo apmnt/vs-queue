@@ -721,6 +721,7 @@ fn render_braille_chart(frame: &mut Frame, area: Rect, chart_data: &ChartData) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(6),
+            Constraint::Length(1),
             Constraint::Length(2),
         ])
         .split(area);
@@ -762,15 +763,6 @@ fn render_braille_chart(frame: &mut Frame, area: Rect, chart_data: &ChartData) {
         .x_bounds(chart_data.x_bounds)
         .y_bounds(chart_data.y_bounds)
         .paint(|ctx| {
-            let axis_color = Color::DarkGray;
-            ctx.draw(&CanvasLine::new(
-                chart_data.x_bounds[0],
-                chart_data.y_bounds[0],
-                chart_data.x_bounds[1],
-                chart_data.y_bounds[0],
-                axis_color,
-            ));
-
             for segment in chart_data.projection.windows(2) {
                 ctx.draw(&CanvasLine::new(
                     segment[0].0,
@@ -797,10 +789,16 @@ fn render_braille_chart(frame: &mut Frame, area: Rect, chart_data: &ChartData) {
         });
     frame.render_widget(canvas, plot_columns[1]);
 
+    let x_axis_line_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(y_label_width), Constraint::Min(10)])
+        .split(rows[2]);
+    render_x_axis_line(frame, x_axis_line_columns[0], x_axis_line_columns[1], axis_style);
+
     let x_axis_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(rows[2]);
+        .split(rows[3]);
     let x_axis_columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -831,6 +829,19 @@ fn render_braille_chart(frame: &mut Frame, area: Rect, chart_data: &ChartData) {
             .style(axis_style.add_modifier(Modifier::BOLD)),
         x_axis_rows[1],
     );
+}
+
+fn render_x_axis_line(frame: &mut Frame, gutter_area: Rect, plot_area: Rect, style: Style) {
+    if gutter_area.width > 0 {
+        let label_width = gutter_area.width.saturating_sub(1) as usize;
+        let corner = format!("{:>label_width$}└", "", label_width = label_width);
+        frame.render_widget(Paragraph::new(corner).style(style), gutter_area);
+    }
+
+    if plot_area.width > 0 {
+        let line = "─".repeat(plot_area.width as usize);
+        frame.render_widget(Paragraph::new(line).style(style), plot_area);
+    }
 }
 
 fn render_y_axis(frame: &mut Frame, area: Rect, chart_data: &ChartData, style: Style) {
